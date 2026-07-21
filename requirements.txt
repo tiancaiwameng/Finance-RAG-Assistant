@@ -1,0 +1,11 @@
+streamlit>=1.41,<2.0
+langchain-core>=0.3,<2.0
+langchain-text-splitters>=0.3,<2.0
+langchain-chroma>=0.2,<2.0
+langchain-huggingface>=0.1,<2.0
+langchain-deepseek>=0.1,<2.0
+chromadb>=0.5,<2.0
+sentence-transformers>=3.3,<6.0
+pypdf>=5.1,<7.0
+python-dotenv>=1.0,<2.0
+
