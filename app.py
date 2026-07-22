@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import streamlit as st
 
 from config import settings
+from src.database import MySQLRepository
 from src.pdf_loader import FinancialPDFLoader, PDFLoadError
-from src.rag_chain import FinancialRAGChain
-from src.utils import compact_excerpt, format_source_label, safe_filename
-from src.vector_store import FinancialVectorStore
+from src.pipeline import UploadValidationError, ValidatedUpload, validate_uploads
+from src.rag_chain import FinancialRAGChain, RAGGenerationError
+from src.utils import compact_excerpt, deduplicate_documents, format_source_label
+from src.vector_store import FinancialVectorStore, VectorStoreError
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 st.set_page_config(page_title="Finance RAG Assistant", page_icon="📊", layout="wide")
@@ -27,12 +38,24 @@ st.markdown(
 )
 
 
+@st.cache_resource
+def get_database() -> MySQLRepository:
+    """每个 Streamlit 进程初始化一次数据库；失败时仓储会自动降级。"""
+    repository = MySQLRepository(settings)
+    repository.initialize()
+    return repository
+
+
+database = get_database()
+
+
 def init_state() -> None:
     defaults = {
         "messages": [],
         "vector_store": None,
         "document_stats": None,
         "indexed_files": [],
+        "document_ids": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -40,32 +63,65 @@ def init_state() -> None:
 
 
 def process_uploads(uploaded_files: list) -> None:
-    total_bytes = sum(file.size for file in uploaded_files)
-    if total_bytes > settings.max_upload_mb * 1024 * 1024:
-        raise ValueError(f"文件总大小不能超过 {settings.max_upload_mb} MB")
+    """执行校验、解析、去重、切分、向量化及可选元数据记录。"""
+    batch = validate_uploads(uploaded_files, settings.max_upload_mb)
+    logger.info("开始处理文档批次：%d 个有效文件", len(batch.files))
+
+    document_ids: dict[str, int] = {}
+    for uploaded in batch.files:
+        document_id = database.upsert_document(
+            uploaded.filename, uploaded.file_hash, 0, "processing"
+        )
+        if document_id is not None:
+            document_ids[uploaded.file_hash] = document_id
 
     loader = FinancialPDFLoader(settings.chunk_size, settings.chunk_overlap)
-    with tempfile.TemporaryDirectory(prefix="finance_rag_") as temp_dir:
-        file_entries: list[tuple[Path, str]] = []
-        for position, uploaded in enumerate(uploaded_files):
-            display_name = safe_filename(uploaded.name)
-            # 序号避免同名文件覆盖；路径只存在于临时目录。
-            temp_path = Path(temp_dir) / f"{position}_{display_name}"
-            temp_path.write_bytes(uploaded.getvalue())
-            file_entries.append((temp_path, display_name))
-        pages = loader.load_many(file_entries)
-        chunks = loader.split(pages)
+    try:
+        with tempfile.TemporaryDirectory(prefix="finance_rag_") as temp_dir:
+            file_entries: list[tuple[Path, ValidatedUpload]] = []
+            for position, uploaded in enumerate(batch.files):
+                # 序号避免同名文件覆盖；路径只存在于受控临时目录。
+                temp_path = Path(temp_dir) / f"{position}_{uploaded.filename}"
+                temp_path.write_bytes(uploaded.content)
+                file_entries.append((temp_path, uploaded))
 
-    vector_store = FinancialVectorStore(settings.embedding_model, settings.chroma_dir)
-    vector_store.build(chunks)
+            pages = []
+            for temp_path, uploaded in file_entries:
+                pages.extend(loader.load(temp_path, uploaded.filename, uploaded.file_hash))
+            raw_chunks = loader.split(pages)
+            chunks, duplicate_chunk_count = deduplicate_documents(raw_chunks)
+            if not chunks:
+                raise PDFLoadError("文档切分后没有可用文本片段。")
+            if duplicate_chunk_count:
+                logger.info("文本片段去重完成：跳过 %d 个重复片段", duplicate_chunk_count)
+
+        vector_store = FinancialVectorStore(settings.embedding_model, settings.chroma_dir)
+        vector_store.build(chunks)
+    except Exception:
+        for uploaded in batch.files:
+            database.update_document(uploaded.file_hash, 0, "failed")
+        raise
+
+    chunk_counts = Counter(str(chunk.metadata.get("file_hash", "")) for chunk in chunks)
+    for uploaded in batch.files:
+        database.update_document(
+            uploaded.file_hash, chunk_counts.get(uploaded.file_hash, 0), "completed"
+        )
+
     st.session_state.vector_store = vector_store
-    st.session_state.indexed_files = [name for _, name in file_entries]
+    st.session_state.indexed_files = [uploaded.filename for uploaded in batch.files]
+    st.session_state.document_ids = document_ids
     st.session_state.document_stats = {
-        "files": len(file_entries),
+        "files": len(batch.files),
         "pages": len(pages),
         "chunks": len(chunks),
+        "duplicate_files": len(batch.duplicate_names),
+        "duplicate_chunks": duplicate_chunk_count,
     }
     st.session_state.messages = []
+    logger.info(
+        "文档批次处理完成：%d 页，%d 个去重片段", len(pages), len(chunks)
+    )
 
 
 def render_sources(sources) -> None:
@@ -103,10 +159,11 @@ with st.sidebar:
                 with st.spinner("正在解析、切分并建立向量知识库…首次运行需下载 Embedding 模型。"):
                     process_uploads(uploaded_files)
                 st.success("知识库建立完成。")
-            except (PDFLoadError, ValueError) as exc:
+            except (PDFLoadError, UploadValidationError, VectorStoreError, ValueError) as exc:
                 st.error(str(exc))
-            except Exception as exc:
-                st.error(f"文档处理失败：{exc}")
+            except Exception:
+                logger.exception("未预期的文档处理错误")
+                st.error("文档处理失败，请查看终端日志获取详细原因。")
 
     stats = st.session_state.document_stats
     if stats:
@@ -116,10 +173,16 @@ with st.sidebar:
         middle.metric("页数", stats["pages"])
         right.metric("片段", stats["chunks"])
         st.caption("已索引：" + "、".join(st.session_state.indexed_files))
+        if stats["duplicate_files"] or stats["duplicate_chunks"]:
+            st.caption(
+                f"已跳过重复文件 {stats['duplicate_files']} 个、重复片段 "
+                f"{stats['duplicate_chunks']} 个。"
+            )
 
     st.divider()
     key_ready = bool(settings.deepseek_api_key and "your_" not in settings.deepseek_api_key)
     st.caption("DeepSeek API：" + ("✅ 已配置" if key_ready else "⚠️ 未配置 .env"))
+    st.caption("MySQL：" + database.status_label)
     if st.button("清空对话", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -158,11 +221,26 @@ else:
                     response = chain.ask(question, top_k=top_k, history=history)
                 st.markdown(response.answer)
                 render_sources(response.sources)
+                referenced_hashes = {
+                    str(source.document.metadata.get("file_hash", ""))
+                    for source in response.sources
+                    if source.document.metadata.get("file_hash")
+                }
+                referenced_ids = [
+                    st.session_state.document_ids[file_hash]
+                    for file_hash in referenced_hashes
+                    if file_hash in st.session_state.document_ids
+                ]
+                database.record_qa(referenced_ids, question, response.answer)
                 st.session_state.messages.append(
                     {"role": "assistant", "content": response.answer, "sources": response.sources}
                 )
-            except Exception as exc:
-                message = f"回答生成失败：{exc}"
+            except (RAGGenerationError, VectorStoreError, ValueError) as exc:
+                message = str(exc)
                 st.error(message)
                 st.session_state.messages.append({"role": "assistant", "content": message})
-
+            except Exception:
+                logger.exception("未预期的问答错误")
+                message = "回答生成失败，请查看终端日志获取详细原因。"
+                st.error(message)
+                st.session_state.messages.append({"role": "assistant", "content": message})

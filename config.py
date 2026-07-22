@@ -25,6 +25,16 @@ def _read_int(name: str, default: int) -> int:
     return parsed
 
 
+def _read_bool(name: str, default: bool = False) -> bool:
+    """读取常见布尔环境变量，非法值立即给出清晰错误。"""
+    value = os.getenv(name, str(default)).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"环境变量 {name} 必须是 true/false，当前值为 {value!r}")
+
+
 @dataclass(frozen=True)
 class Settings:
     """集中管理模型、切分和检索参数。"""
@@ -44,6 +54,17 @@ class Settings:
     top_k: int = field(default_factory=lambda: _read_int("TOP_K", 5))
     max_upload_mb: int = field(default_factory=lambda: _read_int("MAX_UPLOAD_MB", 50))
     chroma_dir: Path = field(default_factory=lambda: BASE_DIR / "chroma_db")
+    mysql_enabled: bool = field(default_factory=lambda: _read_bool("MYSQL_ENABLED", False))
+    mysql_host: str = field(default_factory=lambda: os.getenv("MYSQL_HOST", "127.0.0.1"))
+    mysql_port: int = field(default_factory=lambda: _read_int("MYSQL_PORT", 3306))
+    mysql_user: str = field(default_factory=lambda: os.getenv("MYSQL_USER", ""))
+    mysql_password: str = field(default_factory=lambda: os.getenv("MYSQL_PASSWORD", ""))
+    mysql_database: str = field(
+        default_factory=lambda: os.getenv("MYSQL_DATABASE", "finance_rag")
+    )
+    mysql_connect_timeout: int = field(
+        default_factory=lambda: _read_int("MYSQL_CONNECT_TIMEOUT", 3)
+    )
 
     def validate(self) -> None:
         if self.chunk_overlap >= self.chunk_size:
@@ -56,4 +77,3 @@ class Settings:
 
 settings = Settings()
 settings.validate()
-

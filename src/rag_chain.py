@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -11,6 +12,13 @@ from langchain_deepseek import ChatDeepSeek
 from config import Settings
 from src.utils import compact_excerpt, format_source_label
 from src.vector_store import FinancialVectorStore, SearchResult
+
+
+logger = logging.getLogger(__name__)
+
+
+class RAGGenerationError(RuntimeError):
+    """大模型调用失败，供界面显示稳定且不泄露内部信息的提示。"""
 
 
 SYSTEM_PROMPT = """你是一名严谨的金融研究助理。只能依据“检索证据”回答，不得补充文档外事实。
@@ -87,7 +95,16 @@ class FinancialRAGChain:
         messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
         messages.extend(self._history_messages(history))
         messages.append(HumanMessage(content=user_prompt))
-        response = self.llm.invoke(messages)
+        try:
+            logger.info("开始调用 DeepSeek：检索片段 %d 个", len(results))
+            response = self.llm.invoke(messages)
+        except Exception as exc:
+            logger.exception("DeepSeek 模型调用失败")
+            raise RAGGenerationError(
+                "模型调用失败，请检查 DEEPSEEK_API_KEY、模型名称和网络连接。"
+            ) from exc
         answer = response.content if isinstance(response.content, str) else str(response.content)
+        if not answer.strip():
+            raise RAGGenerationError("模型返回了空答案，请稍后重试。")
+        logger.info("DeepSeek 回答生成完成")
         return RAGResponse(answer=answer, sources=results)
-
